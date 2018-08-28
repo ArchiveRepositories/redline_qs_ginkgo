@@ -290,22 +290,7 @@ void hyperv_setup_mmu_ops(void)
 	if (!(ms_hyperv.hints & HV_X64_REMOTE_TLB_FLUSH_RECOMMENDED))
 		return;
 
-	if (!(ms_hyperv.hints & HV_X64_EX_PROCESSOR_MASKS_RECOMMENDED)) {
-		pr_info("Using hypercall for remote TLB flush\n");
-		pv_mmu_ops.flush_tlb_others = hyperv_flush_tlb_others;
-	} else {
-		pr_info("Using ext hypercall for remote TLB flush\n");
-		pv_mmu_ops.flush_tlb_others = hyperv_flush_tlb_others_ex;
-	}
-}
-
-void hyper_alloc_mmu(void)
-{
-	if (!(ms_hyperv.hints & HV_X64_REMOTE_TLB_FLUSH_RECOMMENDED))
-		return;
-
-	if (!(ms_hyperv.hints & HV_X64_EX_PROCESSOR_MASKS_RECOMMENDED))
-		pcpu_flush = alloc_percpu(struct hv_flush_pcpu *);
-	else
-		pcpu_flush_ex = alloc_percpu(struct hv_flush_pcpu_ex *);
+	pr_info("Using hypercall for remote TLB flush\n");
+	pv_ops.mmu.flush_tlb_others = hyperv_flush_tlb_others;
+	pv_ops.mmu.tlb_remove_table = tlb_remove_table;
 }
