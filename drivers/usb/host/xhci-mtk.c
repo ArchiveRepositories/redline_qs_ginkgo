@@ -383,6 +383,8 @@ static int usb_wakeup_of_property_parse(struct xhci_hcd_mtk *mtk,
 static int xhci_mtk_setup(struct usb_hcd *hcd);
 static const struct xhci_driver_overrides xhci_mtk_overrides __initconst = {
 	.reset = xhci_mtk_setup,
+	.check_bandwidth = xhci_mtk_check_bandwidth,
+	.reset_bandwidth = xhci_mtk_reset_bandwidth,
 };
 
 static struct hc_driver __read_mostly xhci_mtk_hc_driver;

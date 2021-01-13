@@ -73,6 +73,141 @@ static int get_bw_index(struct xhci_hcd *xhci, struct usb_device *udev,
 	return bw_index;
 }
 
+static u32 get_esit(struct xhci_ep_ctx *ep_ctx)
+{
+	u32 esit;
+
+	esit = 1 << CTX_TO_EP_INTERVAL(le32_to_cpu(ep_ctx->ep_info));
+	if (esit > XHCI_MTK_MAX_ESIT)
+		esit = XHCI_MTK_MAX_ESIT;
+
+	return esit;
+}
+
+static struct mu3h_sch_tt *find_tt(struct usb_device *udev)
+{
+	struct usb_tt *utt = udev->tt;
+	struct mu3h_sch_tt *tt, **tt_index, **ptt;
+	unsigned int port;
+	bool allocated_index = false;
+
+	if (!utt)
+		return NULL;	/* Not below a TT */
+
+	/*
+	 * Find/create our data structure.
+	 * For hubs with a single TT, we get it directly.
+	 * For hubs with multiple TTs, there's an extra level of pointers.
+	 */
+	tt_index = NULL;
+	if (utt->multi) {
+		tt_index = utt->hcpriv;
+		if (!tt_index) {	/* Create the index array */
+			tt_index = kcalloc(utt->hub->maxchild,
+					sizeof(*tt_index), GFP_KERNEL);
+			if (!tt_index)
+				return ERR_PTR(-ENOMEM);
+			utt->hcpriv = tt_index;
+			allocated_index = true;
+		}
+		port = udev->ttport - 1;
+		ptt = &tt_index[port];
+	} else {
+		port = 0;
+		ptt = (struct mu3h_sch_tt **) &utt->hcpriv;
+	}
+
+	tt = *ptt;
+	if (!tt) {	/* Create the mu3h_sch_tt */
+		tt = kzalloc(sizeof(*tt), GFP_KERNEL);
+		if (!tt) {
+			if (allocated_index) {
+				utt->hcpriv = NULL;
+				kfree(tt_index);
+			}
+			return ERR_PTR(-ENOMEM);
+		}
+		INIT_LIST_HEAD(&tt->ep_list);
+		tt->usb_tt = utt;
+		tt->tt_port = port;
+		*ptt = tt;
+	}
+
+	return tt;
+}
+
+/* Release the TT above udev, if it's not in use */
+static void drop_tt(struct usb_device *udev)
+{
+	struct usb_tt *utt = udev->tt;
+	struct mu3h_sch_tt *tt, **tt_index, **ptt;
+	int i, cnt;
+
+	if (!utt || !utt->hcpriv)
+		return;		/* Not below a TT, or never allocated */
+
+	cnt = 0;
+	if (utt->multi) {
+		tt_index = utt->hcpriv;
+		ptt = &tt_index[udev->ttport - 1];
+		/*  How many entries are left in tt_index? */
+		for (i = 0; i < utt->hub->maxchild; ++i)
+			cnt += !!tt_index[i];
+	} else {
+		tt_index = NULL;
+		ptt = (struct mu3h_sch_tt **)&utt->hcpriv;
+	}
+
+	tt = *ptt;
+	if (!tt || !list_empty(&tt->ep_list))
+		return;		/* never allocated , or still in use*/
+
+	*ptt = NULL;
+	kfree(tt);
+
+	if (cnt == 1) {
+		utt->hcpriv = NULL;
+		kfree(tt_index);
+	}
+}
+
+static struct mu3h_sch_ep_info *create_sch_ep(struct usb_device *udev,
+	struct usb_host_endpoint *ep, struct xhci_ep_ctx *ep_ctx)
+{
+	struct mu3h_sch_ep_info *sch_ep;
+	struct mu3h_sch_tt *tt = NULL;
+	u32 len_bw_budget_table;
+	size_t mem_size;
+
+	if (is_fs_or_ls(udev->speed))
+		len_bw_budget_table = TT_MICROFRAMES_MAX;
+	else if ((udev->speed >= USB_SPEED_SUPER)
+			&& usb_endpoint_xfer_isoc(&ep->desc))
+		len_bw_budget_table = get_esit(ep_ctx);
+	else
+		len_bw_budget_table = 1;
+
+	mem_size = sizeof(struct mu3h_sch_ep_info) +
+			len_bw_budget_table * sizeof(u32);
+	sch_ep = kzalloc(mem_size, GFP_KERNEL);
+	if (!sch_ep)
+		return ERR_PTR(-ENOMEM);
+
+	if (is_fs_or_ls(udev->speed)) {
+		tt = find_tt(udev);
+		if (IS_ERR(tt)) {
+			kfree(sch_ep);
+			return ERR_PTR(-ENOMEM);
+		}
+	}
+
+	sch_ep->sch_tt = tt;
+	sch_ep->ep = ep;
+	INIT_LIST_HEAD(&sch_ep->tt_endpoint);
+
+	return sch_ep;
+}
+
 static void setup_sch_info(struct usb_device *udev,
 		struct xhci_ep_ctx *ep_ctx, struct mu3h_sch_ep_info *sch_ep)
 {
@@ -309,6 +444,8 @@ int xhci_mtk_sch_init(struct xhci_hcd_mtk *mtk)
 
 	mtk->sch_array = sch_array;
 
+	INIT_LIST_HEAD(&mtk->bw_ep_list_new);
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(xhci_mtk_sch_init);
@@ -327,19 +464,14 @@ int xhci_mtk_add_ep_quirk(struct usb_hcd *hcd, struct usb_device *udev,
 	struct xhci_ep_ctx *ep_ctx;
 	struct xhci_slot_ctx *slot_ctx;
 	struct xhci_virt_device *virt_dev;
-	struct mu3h_sch_bw_info *sch_bw;
 	struct mu3h_sch_ep_info *sch_ep;
-	struct mu3h_sch_bw_info *sch_array;
 	unsigned int ep_index;
-	int bw_index;
-	int ret = 0;
 
 	xhci = hcd_to_xhci(hcd);
 	virt_dev = xhci->devs[udev->slot_id];
 	ep_index = xhci_get_endpoint_index(&ep->desc);
 	slot_ctx = xhci_get_slot_ctx(xhci, virt_dev->in_ctx);
 	ep_ctx = xhci_get_ep_ctx(xhci, virt_dev->in_ctx, ep_index);
-	sch_array = mtk->sch_array;
 
 	xhci_dbg(xhci, "%s() type:%d, speed:%d, mpkt:%d, dir:%d, ep:%p\n",
 		__func__, usb_endpoint_type(&ep->desc), udev->speed,
@@ -358,37 +490,34 @@ int xhci_mtk_add_ep_quirk(struct usb_hcd *hcd, struct usb_device *udev,
 		return 0;
 	}
 
-	bw_index = get_bw_index(xhci, udev, ep);
-	sch_bw = &sch_array[bw_index];
-
-	sch_ep = kzalloc(sizeof(struct mu3h_sch_ep_info), GFP_NOIO);
-	if (!sch_ep)
+	sch_ep = create_sch_ep(udev, ep, ep_ctx);
+	if (IS_ERR_OR_NULL(sch_ep))
 		return -ENOMEM;
 
 	setup_sch_info(udev, ep_ctx, sch_ep);
 
-	ret = check_sch_bw(udev, sch_bw, sch_ep);
-	if (ret) {
-		xhci_err(xhci, "Not enough bandwidth!\n");
-		kfree(sch_ep);
-		return -ENOSPC;
-	}
-
-	list_add_tail(&sch_ep->endpoint, &sch_bw->bw_ep_list);
-	sch_ep->ep = ep;
-
-	ep_ctx->reserved[0] |= cpu_to_le32(EP_BPKTS(sch_ep->pkts)
-		| EP_BCSCOUNT(sch_ep->cs_count) | EP_BBM(sch_ep->burst_mode));
-	ep_ctx->reserved[1] |= cpu_to_le32(EP_BOFFSET(sch_ep->offset)
-		| EP_BREPEAT(sch_ep->repeat));
-
-	xhci_dbg(xhci, " PKTS:%x, CSCOUNT:%x, BM:%x, OFFSET:%x, REPEAT:%x\n",
-			sch_ep->pkts, sch_ep->cs_count, sch_ep->burst_mode,
-			sch_ep->offset, sch_ep->repeat);
+	list_add_tail(&sch_ep->endpoint, &mtk->bw_ep_list_new);
 
 	return 0;
 }
 EXPORT_SYMBOL_GPL(xhci_mtk_add_ep_quirk);
+
+static void xhci_mtk_drop_ep(struct xhci_hcd_mtk *mtk, struct usb_device *udev,
+			     struct mu3h_sch_ep_info *sch_ep)
+{
+	struct xhci_hcd *xhci = hcd_to_xhci(mtk->hcd);
+	int bw_index = get_bw_index(xhci, udev, sch_ep->ep);
+	struct mu3h_sch_bw_info *sch_bw = &mtk->sch_array[bw_index];
+
+	update_bus_bw(sch_bw, sch_ep, 0);
+	list_del(&sch_ep->endpoint);
+
+	if (sch_ep->sch_tt) {
+		list_del(&sch_ep->tt_endpoint);
+		drop_tt(udev);
+	}
+	kfree(sch_ep);
+}
 
 void xhci_mtk_drop_ep_quirk(struct usb_hcd *hcd, struct usb_device *udev,
 		struct usb_host_endpoint *ep)
@@ -399,7 +528,7 @@ void xhci_mtk_drop_ep_quirk(struct usb_hcd *hcd, struct usb_device *udev,
 	struct xhci_virt_device *virt_dev;
 	struct mu3h_sch_bw_info *sch_array;
 	struct mu3h_sch_bw_info *sch_bw;
-	struct mu3h_sch_ep_info *sch_ep;
+	struct mu3h_sch_ep_info *sch_ep, *tmp;
 	int bw_index;
 
 	xhci = hcd_to_xhci(hcd);
@@ -418,14 +547,73 @@ void xhci_mtk_drop_ep_quirk(struct usb_hcd *hcd, struct usb_device *udev,
 	bw_index = get_bw_index(xhci, udev, ep);
 	sch_bw = &sch_array[bw_index];
 
-	list_for_each_entry(sch_ep, &sch_bw->bw_ep_list, endpoint) {
+	list_for_each_entry_safe(sch_ep, tmp, &sch_bw->bw_ep_list, endpoint) {
 		if (sch_ep->ep == ep) {
-			update_bus_bw(sch_bw, sch_ep,
-				-sch_ep->bw_cost_per_microframe);
-			list_del(&sch_ep->endpoint);
-			kfree(sch_ep);
-			break;
+			xhci_mtk_drop_ep(mtk, udev, sch_ep);
 		}
 	}
 }
 EXPORT_SYMBOL_GPL(xhci_mtk_drop_ep_quirk);
+
+int xhci_mtk_check_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
+{
+	struct xhci_hcd_mtk *mtk = hcd_to_mtk(hcd);
+	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+	struct xhci_virt_device *virt_dev = xhci->devs[udev->slot_id];
+	struct mu3h_sch_bw_info *sch_bw;
+	struct mu3h_sch_ep_info *sch_ep, *tmp;
+	int bw_index, ret;
+
+	dev_dbg(&udev->dev, "%s\n", __func__);
+
+	list_for_each_entry(sch_ep, &mtk->bw_ep_list_new, endpoint) {
+		bw_index = get_bw_index(xhci, udev, sch_ep->ep);
+		sch_bw = &mtk->sch_array[bw_index];
+
+		ret = check_sch_bw(udev, sch_bw, sch_ep);
+		if (ret) {
+			xhci_err(xhci, "Not enough bandwidth!\n");
+			return -ENOSPC;
+		}
+	}
+
+	list_for_each_entry_safe(sch_ep, tmp, &mtk->bw_ep_list_new, endpoint) {
+		struct xhci_ep_ctx *ep_ctx;
+		struct usb_host_endpoint *ep = sch_ep->ep;
+		unsigned int ep_index = xhci_get_endpoint_index(&ep->desc);
+
+		bw_index = get_bw_index(xhci, udev, ep);
+		sch_bw = &mtk->sch_array[bw_index];
+
+		list_move_tail(&sch_ep->endpoint, &sch_bw->bw_ep_list);
+
+		ep_ctx = xhci_get_ep_ctx(xhci, virt_dev->in_ctx, ep_index);
+		ep_ctx->reserved[0] |= cpu_to_le32(EP_BPKTS(sch_ep->pkts)
+			| EP_BCSCOUNT(sch_ep->cs_count)
+			| EP_BBM(sch_ep->burst_mode));
+		ep_ctx->reserved[1] |= cpu_to_le32(EP_BOFFSET(sch_ep->offset)
+			| EP_BREPEAT(sch_ep->repeat));
+
+		xhci_dbg(xhci, " PKTS:%x, CSCOUNT:%x, BM:%x, OFFSET:%x, REPEAT:%x\n",
+			sch_ep->pkts, sch_ep->cs_count, sch_ep->burst_mode,
+			sch_ep->offset, sch_ep->repeat);
+	}
+
+	return xhci_check_bandwidth(hcd, udev);
+}
+EXPORT_SYMBOL_GPL(xhci_mtk_check_bandwidth);
+
+void xhci_mtk_reset_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
+{
+	struct xhci_hcd_mtk *mtk = hcd_to_mtk(hcd);
+	struct mu3h_sch_ep_info *sch_ep, *tmp;
+
+	dev_dbg(&udev->dev, "%s\n", __func__);
+
+	list_for_each_entry_safe(sch_ep, tmp, &mtk->bw_ep_list_new, endpoint) {
+		xhci_mtk_drop_ep(mtk, udev, sch_ep);
+	}
+
+	xhci_reset_bandwidth(hcd, udev);
+}
+EXPORT_SYMBOL_GPL(xhci_mtk_reset_bandwidth);
